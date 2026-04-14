@@ -130,14 +130,13 @@ The requirement says OS thread ID if available.
 
 Current LevelDB logging only records `std::this_thread::get_id()` as a textual
 thread identifier in the human-readable logger. That is not guaranteed to be the
-OS TID. If ETW comparison truly needs OS TID parity, we should add a small
-platform helper:
+OS TID. We will add a small platform helper:
 
 - Linux: `syscall(SYS_gettid)`
 - Windows: `GetCurrentThreadId()`
 
-If exact OS TID is not strictly required, a process-unique thread identifier is
-still sufficient for within-process ground truth.
+**Decision: use real OS TID.** This gives the strongest parity with ETW thread
+attribution and is low-cost to implement.
 
 ### 4. `smallest_user_key`, `largest_user_key`, `seqno_smallest`, `seqno_largest`
 
@@ -183,25 +182,28 @@ Reason:
 So the right place is inside or immediately after `InstallCompactionResults()`
 once `versions_->LogAndApply(...)` returns `OK`.
 
+**Decision: `job_input_delete` means logical install-time obsolescence, not
+physical unlink timing.** Physical unlink timing from `RemoveObsoleteFiles()` is
+deferred to a later pass.
+
 ### 7. trivial move jobs
 
 The current code handles non-manual trivial moves in `BackgroundCompaction()`
 without entering `DoCompactionWork()`.
 
-If the oracle is meant to cover every real compaction-like version edit, trivial
-moves need their own job path with:
+**Decision: include trivial moves as first-class jobs in the oracle.** They
+require their own job path with:
 
 - `job_start`
 - `job_input`
 - `job_install`
-- `job_input_delete` only if the source-level file is logically removed as part
-  of the version edit semantics you want to model
+- `job_input_delete` (the source-level file is logically obsolete after install)
 - `job_end`
 
 There will be no `job_output_create` or `job_output_finish` because no new SST
 is written.
 
-This is the main reason the oracle should not be implemented only inside
+This is the main reason the oracle must not be implemented only inside
 `DoCompactionWork()`.
 
 ## Recommended implementation design
@@ -501,19 +503,14 @@ Defer to a later pass:
 This modification is a good fit for the current codebase.
 
 The clean implementation is to add a dedicated compaction trace writer and emit
-normalized CSV rows from the existing compaction lifecycle hooks. The only
-material design decisions are:
+normalized CSV rows from the existing compaction lifecycle hooks. The three
+material design decisions have been resolved:
 
-- whether `bg_thread_id` must be a real OS TID or a process-local thread ID
-- whether `job_input_delete` should mean logical obsolescence at install or
-  physical unlink timing
-- whether trivial moves should be included as first-class jobs
+- **`bg_thread_id`**: use real OS TID (`syscall(SYS_gettid)` on Linux,
+  `GetCurrentThreadId()` on Windows)
+- **`job_input_delete`**: logical install-time obsolescence; physical unlink
+  timing is deferred
+- **trivial moves**: included as first-class jobs in the oracle
 
-My recommendation is:
-
-- use real OS TID where practical
-- define `job_input_delete` as logical install-time obsolescence
-- include trivial moves in the oracle
-
-That will give the strongest ground truth for validating the ETW-based
+These decisions give the strongest ground truth for validating the ETW-based
 reconstruction pipeline without overcomplicating the first implementation.

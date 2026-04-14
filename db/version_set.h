@@ -114,6 +114,11 @@ class Version {
   // Return a human readable string that describes this version's contents.
   std::string DebugString() const;
 
+  // Accessors for compaction-trigger state; used by compaction tracing to
+  // derive compaction_reason without modifying VersionSet::PickCompaction().
+  double compaction_score() const { return compaction_score_; }
+  FileMetaData* file_to_compact() const { return file_to_compact_; }
+
  private:
   friend class Compaction;
   friend class VersionSet;

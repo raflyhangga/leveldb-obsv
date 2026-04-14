@@ -39,6 +39,35 @@ namespace leveldb {
 
 const int kNumNonTableCacheFiles = 10;
 
+// ---------------------------------------------------------------------------
+// Compaction trace helpers
+// ---------------------------------------------------------------------------
+
+// Extracts the user key bytes (raw) from an InternalKey.
+static std::string TraceUserKey(const InternalKey& ikey) {
+  Slice uk = ikey.user_key();
+  return std::string(uk.data(), uk.size());
+}
+
+// Extracts the sequence number from an InternalKey.
+// Internal key encoding: user_key + fixed64((seqno << 8) | value_type).
+static uint64_t TraceSeqno(const InternalKey& ikey) {
+  Slice enc = ikey.Encode();
+  if (enc.size() < 8) return 0;
+  return DecodeFixed64(enc.data() + enc.size() - 8) >> 8;
+}
+
+// Fills the key-range fields of a trace Row from an InternalKey pair.
+static void TraceSetKeyRange(CompactionTraceWriter::Row* row,
+                             const InternalKey& smallest,
+                             const InternalKey& largest) {
+  row->has_file_keys = true;
+  row->smallest_user_key = TraceUserKey(smallest);
+  row->largest_user_key = TraceUserKey(largest);
+  row->seqno_smallest = TraceSeqno(smallest);
+  row->seqno_largest = TraceSeqno(largest);
+}
+
 // Information kept for every waiting writer
 struct DBImpl::Writer {
   explicit Writer(port::Mutex* mu)
@@ -66,7 +95,11 @@ struct DBImpl::CompactionState {
         smallest_snapshot(0),
         outfile(nullptr),
         builder(nullptr),
-        total_bytes(0) {}
+        total_bytes(0),
+        job_id(0),
+        is_manual(false),
+        start_ts_us(0),
+        bg_thread_id(0) {}
 
   Compaction* const compaction;
 
@@ -83,6 +116,13 @@ struct DBImpl::CompactionState {
   TableBuilder* builder;
 
   uint64_t total_bytes;
+
+  // Trace context (populated by BackgroundCompaction before DoCompactionWork).
+  uint64_t job_id;
+  bool is_manual;
+  std::string compaction_reason;
+  uint64_t start_ts_us;
+  uint64_t bg_thread_id;
 };
 
 // Fix user-supplied options to be reasonable
@@ -147,7 +187,12 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
       background_compaction_scheduled_(false),
       manual_compaction_(nullptr),
       versions_(new VersionSet(dbname_, &options_, table_cache_,
-                               &internal_comparator_)) {}
+                               &internal_comparator_)),
+      trace_writer_(raw_options.compaction_trace_path != nullptr
+                        ? CompactionTraceWriter::Open(raw_options.env,
+                                                      raw_options.compaction_trace_path)
+                        : nullptr),
+      next_compaction_job_id_(1) {}
 
 DBImpl::~DBImpl() {
   // Wait for background work to finish.
@@ -176,6 +221,7 @@ DBImpl::~DBImpl() {
   if (owns_cache_) {
     delete options_.block_cache;
   }
+  delete trace_writer_;
 }
 
 Status DBImpl::NewDB() {
@@ -716,6 +762,18 @@ void DBImpl::BackgroundCompaction() {
   Compaction* c;
   bool is_manual = (manual_compaction_ != nullptr);
   InternalKey manual_end;
+
+  // Derive compaction reason before calling PickCompaction so that we can
+  // inspect version state while mutex_ is still held.
+  const char* compaction_reason = "manual";
+  if (!is_manual) {
+    if (versions_->current()->compaction_score() >= 1) {
+      compaction_reason = "size";
+    } else {
+      compaction_reason = "seek";
+    }
+  }
+
   if (is_manual) {
     ManualCompaction* m = manual_compaction_;
     c = versions_->CompactRange(m->level, m->begin, m->end);
@@ -739,6 +797,47 @@ void DBImpl::BackgroundCompaction() {
     // Move file to next level
     assert(c->num_input_files(0) == 1);
     FileMetaData* f = c->input(0, 0);
+
+    // --- Trivial-move oracle path ---
+    uint64_t trivial_job_id = 0;
+    uint64_t trivial_start_ts = 0;
+    uint64_t trivial_tid = 0;
+    if (trace_writer_ != nullptr) {
+      trivial_job_id = next_compaction_job_id_++;
+      trivial_start_ts = env_->NowMicros();
+      trivial_tid = CurrentOsThreadId();
+
+      // job_start
+      CompactionTraceWriter::Row r;
+      r.trace_ts_us = trivial_start_ts;
+      r.job_id = trivial_job_id;
+      r.event_type = "job_start";
+      r.db_name = dbname_;
+      r.is_manual = 0;
+      r.is_trivial_move = 1;
+      r.compaction_reason = compaction_reason;
+      r.source_level = c->level();
+      r.target_level = c->level() + 1;
+      r.bg_thread_id = trivial_tid;
+      TraceSetKeyRange(&r, f->smallest, f->largest);
+      trace_writer_->Write(r);
+
+      // job_input (the single file being moved)
+      r = CompactionTraceWriter::Row();
+      r.trace_ts_us = env_->NowMicros();
+      r.job_id = trivial_job_id;
+      r.event_type = "job_input";
+      r.db_name = dbname_;
+      r.source_level = c->level();
+      r.target_level = c->level() + 1;
+      r.bg_thread_id = trivial_tid;
+      r.file_number = f->number;
+      r.file_size = f->file_size;
+      TraceSetKeyRange(&r, f->smallest, f->largest);
+      trace_writer_->Write(r);
+    }
+    // --------------------------------
+
     c->edit()->RemoveFile(c->level(), f->number);
     c->edit()->AddFile(c->level() + 1, f->number, f->file_size, f->smallest,
                        f->largest);
@@ -751,8 +850,65 @@ void DBImpl::BackgroundCompaction() {
         static_cast<unsigned long long>(f->number), c->level() + 1,
         static_cast<unsigned long long>(f->file_size),
         status.ToString().c_str(), versions_->LevelSummary(&tmp));
+
+    // --- Trivial-move oracle path (post-install) ---
+    if (trace_writer_ != nullptr) {
+      // job_install
+      CompactionTraceWriter::Row r;
+      r.trace_ts_us = env_->NowMicros();
+      r.job_id = trivial_job_id;
+      r.event_type = "job_install";
+      r.db_name = dbname_;
+      r.source_level = c->level();
+      r.target_level = c->level() + 1;
+      r.bg_thread_id = trivial_tid;
+      r.status = status.ok() ? "ok" : status.ToString();
+      trace_writer_->Write(r);
+
+      if (status.ok()) {
+        // job_input_delete (logical obsolescence of the moved file)
+        r = CompactionTraceWriter::Row();
+        r.trace_ts_us = env_->NowMicros();
+        r.job_id = trivial_job_id;
+        r.event_type = "job_input_delete";
+        r.db_name = dbname_;
+        r.source_level = c->level();
+        r.bg_thread_id = trivial_tid;
+        r.file_number = f->number;
+        r.file_size = f->file_size;
+        TraceSetKeyRange(&r, f->smallest, f->largest);
+        r.notes = "logical install-time obsolescence";
+        trace_writer_->Write(r);
+      }
+
+      // job_end
+      r = CompactionTraceWriter::Row();
+      r.trace_ts_us = env_->NowMicros();
+      r.job_id = trivial_job_id;
+      r.event_type = "job_end";
+      r.db_name = dbname_;
+      r.source_level = c->level();
+      r.target_level = c->level() + 1;
+      r.bg_thread_id = trivial_tid;
+      r.status = status.ok() ? "ok" : status.ToString();
+      r.bytes_read_logical = f->file_size;
+      r.bytes_written_logical = 0;  // no bytes written for trivial move
+      r.input_count = 1;
+      r.output_count = 0;
+      trace_writer_->Write(r);
+    }
+    // -----------------------------------------------
   } else {
     CompactionState* compact = new CompactionState(c);
+
+    // Populate trace context before entering DoCompactionWork.
+    if (trace_writer_ != nullptr) {
+      compact->job_id = next_compaction_job_id_++;
+      compact->is_manual = is_manual;
+      compact->compaction_reason = compaction_reason;
+      compact->bg_thread_id = CurrentOsThreadId();
+    }
+
     status = DoCompactionWork(compact);
     if (!status.ok()) {
       RecordBackgroundError(status);
@@ -825,6 +981,24 @@ Status DBImpl::OpenCompactionOutputFile(CompactionState* compact) {
   if (s.ok()) {
     compact->builder = new TableBuilder(options_, compact->outfile);
   }
+
+  // job_output_create
+  if (s.ok() && trace_writer_ != nullptr) {
+    CompactionTraceWriter::Row r;
+    r.trace_ts_us = env_->NowMicros();
+    r.job_id = compact->job_id;
+    r.event_type = "job_output_create";
+    r.db_name = dbname_;
+    r.bg_thread_id = compact->bg_thread_id;
+    r.file_number = file_number;
+    // Emit the base filename only (not the full absolute path).
+    r.file_name = fname.substr(fname.rfind('/') == std::string::npos
+                                    ? 0
+                                    : fname.rfind('/') + 1);
+    r.output_level = compact->compaction->level() + 1;
+    trace_writer_->Write(r);
+  }
+
   return s;
 }
 
@@ -874,6 +1048,25 @@ Status DBImpl::FinishCompactionOutputFile(CompactionState* compact,
           (unsigned long long)current_bytes);
     }
   }
+
+  // job_output_finish — emit only for successfully finished outputs.
+  if (s.ok() && trace_writer_ != nullptr && current_entries > 0) {
+    const CompactionState::Output& out = *compact->current_output();
+    CompactionTraceWriter::Row r;
+    r.trace_ts_us = env_->NowMicros();
+    r.job_id = compact->job_id;
+    r.event_type = "job_output_finish";
+    r.db_name = dbname_;
+    r.bg_thread_id = compact->bg_thread_id;
+    r.file_number = out.number;
+    r.file_size = out.file_size;
+    r.output_level = compact->compaction->level() + 1;
+    if (!out.smallest.Encode().empty() && !out.largest.Encode().empty()) {
+      TraceSetKeyRange(&r, out.smallest, out.largest);
+    }
+    trace_writer_->Write(r);
+  }
+
   return s;
 }
 
@@ -892,7 +1085,49 @@ Status DBImpl::InstallCompactionResults(CompactionState* compact) {
     compact->compaction->edit()->AddFile(level + 1, out.number, out.file_size,
                                          out.smallest, out.largest);
   }
-  return versions_->LogAndApply(compact->compaction->edit(), &mutex_);
+  Status s = versions_->LogAndApply(compact->compaction->edit(), &mutex_);
+
+  if (trace_writer_ != nullptr) {
+    // job_install — emitted regardless of success/failure.
+    {
+      CompactionTraceWriter::Row r;
+      r.trace_ts_us = env_->NowMicros();
+      r.job_id = compact->job_id;
+      r.event_type = "job_install";
+      r.db_name = dbname_;
+      r.source_level = compact->compaction->level();
+      r.target_level = compact->compaction->level() + 1;
+      r.bg_thread_id = compact->bg_thread_id;
+      r.status = s.ok() ? "ok" : s.ToString();
+      trace_writer_->Write(r);
+    }
+
+    // job_input_delete — emitted only on successful install.
+    // Represents logical install-time obsolescence; physical unlink timing
+    // is deferred to RemoveObsoleteFiles().
+    if (s.ok()) {
+      for (int which = 0; which < 2; which++) {
+        int src_level = compact->compaction->level() + which;
+        for (int i = 0; i < compact->compaction->num_input_files(which); i++) {
+          const FileMetaData* f = compact->compaction->input(which, i);
+          CompactionTraceWriter::Row r;
+          r.trace_ts_us = env_->NowMicros();
+          r.job_id = compact->job_id;
+          r.event_type = "job_input_delete";
+          r.db_name = dbname_;
+          r.source_level = src_level;
+          r.bg_thread_id = compact->bg_thread_id;
+          r.file_number = f->number;
+          r.file_size = f->file_size;
+          TraceSetKeyRange(&r, f->smallest, f->largest);
+          r.notes = "logical install-time obsolescence";
+          trace_writer_->Write(r);
+        }
+      }
+    }
+  }
+
+  return s;
 }
 
 Status DBImpl::DoCompactionWork(CompactionState* compact) {
@@ -911,6 +1146,69 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
     compact->smallest_snapshot = versions_->LastSequence();
   } else {
     compact->smallest_snapshot = snapshots_.oldest()->sequence_number();
+  }
+
+  // Emit job_start and job_input rows while mutex_ is still held so that
+  // the complete selected input set is recorded before any output activity.
+  if (trace_writer_ != nullptr) {
+    compact->start_ts_us = start_micros;
+
+    // Compute the compaction-wide key range from the union of all inputs.
+    const InternalKey* job_smallest = nullptr;
+    const InternalKey* job_largest = nullptr;
+    const InternalKeyComparator& icmp = internal_comparator_;
+    for (int which = 0; which < 2; which++) {
+      for (int i = 0; i < compact->compaction->num_input_files(which); i++) {
+        const FileMetaData* f = compact->compaction->input(which, i);
+        if (job_smallest == nullptr ||
+            icmp.Compare(f->smallest, *job_smallest) < 0) {
+          job_smallest = &f->smallest;
+        }
+        if (job_largest == nullptr ||
+            icmp.Compare(f->largest, *job_largest) > 0) {
+          job_largest = &f->largest;
+        }
+      }
+    }
+
+    // job_start
+    {
+      CompactionTraceWriter::Row r;
+      r.trace_ts_us = start_micros;
+      r.job_id = compact->job_id;
+      r.event_type = "job_start";
+      r.db_name = dbname_;
+      r.is_manual = compact->is_manual ? 1 : 0;
+      r.is_trivial_move = 0;
+      r.compaction_reason = compact->compaction_reason;
+      r.source_level = compact->compaction->level();
+      r.target_level = compact->compaction->level() + 1;
+      r.bg_thread_id = compact->bg_thread_id;
+      if (job_smallest != nullptr && job_largest != nullptr) {
+        TraceSetKeyRange(&r, *job_smallest, *job_largest);
+      }
+      trace_writer_->Write(r);
+    }
+
+    // job_input — one row per selected input file.
+    for (int which = 0; which < 2; which++) {
+      int src_level = compact->compaction->level() + which;
+      for (int i = 0; i < compact->compaction->num_input_files(which); i++) {
+        const FileMetaData* f = compact->compaction->input(which, i);
+        CompactionTraceWriter::Row r;
+        r.trace_ts_us = env_->NowMicros();
+        r.job_id = compact->job_id;
+        r.event_type = "job_input";
+        r.db_name = dbname_;
+        r.source_level = src_level;
+        r.target_level = compact->compaction->level() + 1;
+        r.bg_thread_id = compact->bg_thread_id;
+        r.file_number = f->number;
+        r.file_size = f->file_size;
+        TraceSetKeyRange(&r, f->smallest, f->largest);
+        trace_writer_->Write(r);
+      }
+    }
   }
 
   Iterator* input = versions_->MakeInputIterator(compact->compaction);
@@ -1053,6 +1351,29 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   }
   VersionSet::LevelSummaryStorage tmp;
   Log(options_.info_log, "compacted to: %s", versions_->LevelSummary(&tmp));
+
+  // job_end
+  if (trace_writer_ != nullptr) {
+    int total_inputs = 0;
+    for (int which = 0; which < 2; which++) {
+      total_inputs += compact->compaction->num_input_files(which);
+    }
+    CompactionTraceWriter::Row r;
+    r.trace_ts_us = env_->NowMicros();
+    r.job_id = compact->job_id;
+    r.event_type = "job_end";
+    r.db_name = dbname_;
+    r.source_level = compact->compaction->level();
+    r.target_level = compact->compaction->level() + 1;
+    r.bg_thread_id = compact->bg_thread_id;
+    r.status = status.ok() ? "ok" : status.ToString();
+    r.bytes_read_logical = static_cast<uint64_t>(stats.bytes_read);
+    r.bytes_written_logical = static_cast<uint64_t>(stats.bytes_written);
+    r.input_count = total_inputs;
+    r.output_count = static_cast<int>(compact->outputs.size());
+    trace_writer_->Write(r);
+  }
+
   return status;
 }
 

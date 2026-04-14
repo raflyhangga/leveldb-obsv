@@ -127,6 +127,103 @@ on google/leveldb/main. This keeps the commit timeline linear and more easily sy
 with the internal repository at Google. More information at GitHub's
 [About Git rebase](https://help.github.com/articles/about-git-rebase/) page.
 
+# Compaction Oracle (this fork)
+
+This fork instruments LevelDB with a **compaction oracle** — a CSV trace writer that logs compaction lifecycle events for validating an ETW-based compaction-job reconstruction pipeline.
+
+## Building db_bench
+
+```bash
+git submodule update --init --recursive
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target db_bench -j
+```
+
+## Running with compaction tracing
+
+Pass `--compaction_trace_path=<path>` to any `db_bench` invocation to enable tracing.
+
+**Workload A — pure write, no compaction (sanity check)**
+```bash
+rm -rf /tmp/ldb-a
+./build/db_bench \
+  --db=/tmp/ldb-a --benchmarks=fillseq \
+  --threads=1 --compression=0 \
+  --num=100 --value_size=1024 \
+  --write_buffer_size=65536 --max_file_size=1048576 \
+  --compaction_trace_path=/tmp/trace-a.csv
+```
+Expected: trace file created with header only — no compaction events.
+
+**Workload B — single L0→L1 compaction**
+```bash
+rm -rf /tmp/ldb-b
+./build/db_bench \
+  --db=/tmp/ldb-b --benchmarks=fillrandom,compact \
+  --threads=1 --compression=0 \
+  --num=320 --value_size=1024 \
+  --write_buffer_size=65536 --max_file_size=1048576 \
+  --compaction_trace_path=/tmp/trace-b.csv
+```
+Expected: one `job_id` group, `compaction_reason=size`, L0→L1.
+
+**Workload C — multi-level compaction**
+```bash
+rm -rf /tmp/ldb-c
+./build/db_bench \
+  --db=/tmp/ldb-c --benchmarks=fillrandom,stats \
+  --threads=1 --compression=0 \
+  --num=50000 --value_size=1024 \
+  --write_buffer_size=65536 --max_file_size=1048576 \
+  --compaction_trace_path=/tmp/trace-c.csv
+```
+Expected: multiple `job_id` groups covering L0→L1 and L1→L2.
+
+## CSV schema
+
+26 columns, one row per event, all jobs in a single flat file:
+
+```
+trace_ts_us, event_index, job_id, event_type, db_name, cf_name,
+is_manual, is_trivial_move, compaction_reason,
+source_level, target_level, bg_thread_id,
+file_number, file_name, file_size,
+smallest_user_key, largest_user_key, seqno_smallest, seqno_largest,
+output_level, status,
+bytes_read_logical, bytes_written_logical,
+input_count, output_count, notes
+```
+
+Event sequence per job: `job_start → job_input×N → job_output_create → job_output_finish → job_install → job_input_delete×N → job_end`.
+
+Trivial moves emit `job_start`, `job_input`, `job_install`, `job_input_delete`, and `job_end` (no `job_output_*`).
+
+## Validating the output
+
+```bash
+# Row count (subtract 1 for header)
+wc -l /tmp/trace-b.csv
+
+# Verify all rows have exactly 26 columns
+python3 -c "
+import csv
+with open('/tmp/trace-b.csv') as f:
+    for i, row in enumerate(csv.reader(f)):
+        if len(row) != 26:
+            print(f'row {i}: {len(row)} columns')
+print('done')
+"
+```
+
+## Tuning notes
+
+- **No compaction (Workload B):** increase `--num` in steps of 64.
+- **Too many jobs:** reduce `--num` slightly.
+- **L2 not reached (Workload C):** raise `--num` to 60000 or 75000.
+- Keep `--threads=1 --compression=0` to minimize trace noise.
+
+---
+
 # Performance
 
 Here is a performance report (with explanations) from the run of the

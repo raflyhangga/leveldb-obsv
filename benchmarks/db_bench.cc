@@ -126,6 +126,9 @@ static bool FLAGS_compression = true;
 // Use the db with the following name.
 static const char* FLAGS_db = nullptr;
 
+// If non-empty, write a compaction oracle CSV to this path.
+static const char* FLAGS_compaction_trace_path = nullptr;
+
 // ZSTD compression level to try out
 static int FLAGS_zstd_compression_level = 1;
 
@@ -816,6 +819,10 @@ class Benchmark {
     options.reuse_logs = FLAGS_reuse_logs;
     options.compression =
         FLAGS_compression ? kSnappyCompression : kNoCompression;
+    if (FLAGS_compaction_trace_path != nullptr &&
+        FLAGS_compaction_trace_path[0] != '\0') {
+      options.compaction_trace_path = FLAGS_compaction_trace_path;
+    }
     Status s = DB::Open(options, FLAGS_db, &db_);
     if (!s.ok()) {
       std::fprintf(stderr, "open error: %s\n", s.ToString().c_str());
@@ -1117,6 +1124,8 @@ int main(int argc, char** argv) {
       FLAGS_open_files = n;
     } else if (strncmp(argv[i], "--db=", 5) == 0) {
       FLAGS_db = argv[i] + 5;
+    } else if (strncmp(argv[i], "--compaction_trace_path=", 24) == 0) {
+      FLAGS_compaction_trace_path = argv[i] + 24;
     } else {
       std::fprintf(stderr, "Invalid flag '%s'\n", argv[i]);
       std::exit(1);

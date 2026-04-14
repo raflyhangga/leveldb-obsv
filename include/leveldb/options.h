@@ -145,6 +145,12 @@ struct LEVELDB_EXPORT Options {
   // Many applications will benefit from passing the result of
   // NewBloomFilterPolicy() here.
   const FilterPolicy* filter_policy = nullptr;
+
+  // If non-null, write a machine-readable CSV compaction oracle to this path.
+  // The file is created (or truncated) when the database is opened. Each row
+  // records one compaction lifecycle event; see db/compaction_trace_writer.h
+  // for the full schema. Tracing is disabled when this field is nullptr.
+  const char* compaction_trace_path = nullptr;
 };
 
 // Options that control read operations

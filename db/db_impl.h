@@ -10,6 +10,7 @@
 #include <set>
 #include <string>
 
+#include "db/compaction_trace_writer.h"
 #include "db/dbformat.h"
 #include "db/log_writer.h"
 #include "db/snapshot.h"
@@ -203,6 +204,15 @@ class DBImpl : public DB {
   Status bg_error_ GUARDED_BY(mutex_);
 
   CompactionStats stats_[config::kNumLevels] GUARDED_BY(mutex_);
+
+  // Compaction oracle trace writer.  Non-null only when tracing is enabled
+  // (Options::compaction_trace_path != nullptr).  Created at DB open time and
+  // destroyed with the DB.  CompactionTraceWriter is internally thread-safe.
+  CompactionTraceWriter* trace_writer_;
+
+  // Monotonically increasing compaction job ID counter.  Accessed only while
+  // mutex_ is held, so a plain uint64_t is sufficient.
+  uint64_t next_compaction_job_id_ GUARDED_BY(mutex_);
 };
 
 // Sanitize db options.  The caller should delete result.info_log if

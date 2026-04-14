@@ -124,6 +124,8 @@ target_sources(leveldb
     "db/builder.cc"
     "db/builder.h"
     "db/c.cc"
+    "db/compaction_trace_writer.cc"
+    "db/compaction_trace_writer.h"
     "db/db_impl.cc"
     "db/db_impl.h"
     "db/db_iter.cc"
