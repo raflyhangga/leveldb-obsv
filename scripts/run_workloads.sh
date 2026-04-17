@@ -63,12 +63,16 @@ run_workload() {
   local start=$SECONDS
   local iter=0
 
+  echo "Deleting DB dir: ${db_dir}"
+  rm -rf "$db_dir"
+  mkdir -p "$db_dir"
+
+
   while (( SECONDS - start < DURATION )); do
     iter=$(( iter + 1 ))
     local elapsed=$(( SECONDS - start ))
     progress_bar "$elapsed" "$DURATION" "$iter"
 
-    rm -rf "$db_dir"
     "$BENCH" \
       --db="$db_dir" \
       --compaction_trace_path="$trace" \
@@ -84,21 +88,21 @@ run_workload() {
 
 case "$WORKLOAD" in
   a)
-    run_workload "A" "/tmp/ldb-a" "/tmp/trace-a.csv" \
+    run_workload "A" "/mntData2/compaction_trace/ground_truth/tmp/ldb-a" "/mntData2/compaction_trace/ground_truth/trace-a.csv" \
       --benchmarks=fillseq \
       --threads=1 --compression=0 \
       --num=100 --value_size=1024 \
       --write_buffer_size=65536 --max_file_size=1048576
     ;;
   b)
-    run_workload "B" "/tmp/ldb-b" "/tmp/trace-b.csv" \
+    run_workload "B" "/mntData2/compaction_trace/ground_truth/tmp/ldb-b" "/mntData2/compaction_trace/ground_truth/trace-b.csv" \
       --benchmarks=fillrandom,compact \
       --threads=1 --compression=0 \
       --num=450 --value_size=1024 \
       --write_buffer_size=65536 --max_file_size=1048576
     ;;
   c)
-    run_workload "C" "/tmp/ldb-c" "/tmp/trace-c.csv" \
+    run_workload "C" "/mntData2/compaction_trace/ground_truth/tmp/ldb-c" "/mntData2/compaction_trace/ground_truth/trace-c.csv" \
       --benchmarks=fillrandom,stats \
       --threads=1 --compression=0 \
       --num=50000 --value_size=1024 \
@@ -106,4 +110,4 @@ case "$WORKLOAD" in
     ;;
 esac
 
-echo "Trace: /tmp/trace-${WORKLOAD}.csv (last iteration)"
+echo "Trace: /mntData2/compaction_trace/ground_truth/trace-${WORKLOAD}.csv (last iteration)"
