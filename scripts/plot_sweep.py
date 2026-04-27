@@ -25,20 +25,21 @@ rows = []
 with summary_path.open() as f:
     reader = csv.DictReader(f, delimiter="\t")
     for r in reader:
-        rows.append({
-            "num":             int(r["num"]),
-            "job_starts":      int(r["job_starts"]),
-            "job_completions": int(r["job_completions"]),
-        })
+        rows.append(
+            {
+                "num": int(r["num"]),
+                "compaction_jobs": int(r["compaction_jobs"]),
+                "flush_imm_returns": int(r["flush_imm_returns"]),
+                "total_background_returns": int(r["total_background_returns"]),
+            }
+        )
 
 rows.sort(key=lambda r: r["num"])
-nums        = [r["num"]             for r in rows]
-starts      = [r["job_starts"]      for r in rows]
-completions = [r["job_completions"] for r in rows]
-totals      = [s + c for s, c in zip(starts, completions)]
+nums = [r["num"] for r in rows]
+compaction_jobs = [r["compaction_jobs"] for r in rows]
 
 # ── Scale decisions ────────────────────────────────────────────────────────────
-max_total = max(totals) if totals else 1
+max_jobs = max(compaction_jobs) if compaction_jobs else 1
 
 # Log x when nums span more than 20×
 use_logx = len(nums) > 1 and nums[-1] / nums[0] > 20
@@ -66,12 +67,17 @@ fig, ax = plt.subplots(figsize=(8, 4))
 if use_logx:
     ax.set_xscale("log")
 
-# Stacked bars: started (bottom) and completed (top)
-ax.bar(nums, starts,      width=w_halfs,                label="jobs started (job_start)",    color="#f97316")
-ax.bar(nums, completions, width=w_halfs, bottom=starts, label="jobs completed (job_end ok)",  color="#3b82f6")
+# Compaction jobs: background_compaction_return excluding notes="flush_imm"
+ax.bar(
+    nums,
+    compaction_jobs,
+    width=w_halfs,
+    label='compaction jobs (event="background_compaction_return" && notes!="flush_imm")',
+    color="#3b82f6",
+)
 
 # ── Y-axis scale & headroom ────────────────────────────────────────────────────
-y_top = max_total * 1.30
+y_top = max_jobs * 1.30
 ax.set_ylim(bottom=0, top=y_top)
 
 # Tight x margins
@@ -80,20 +86,33 @@ ax.set_xlim(
     nums[-1] * (10 ** 0.18) if use_logx else nums[-1] + w_halfs[-1],
 )
 
-# ── Bar annotations (total at top of stack, segments inside) ──────────────────
-for r, x_pos, total in zip(rows, nums, totals):
-    # segment mid-labels (only if segment is tall enough to show)
-    s, c = r["job_starts"], r["job_completions"]
-    if s > 0:
-        ax.text(x_pos, s / 2, str(s),
-                ha="center", va="center", fontsize=6, color="#7c2d12")
-    if c > 0:
-        ax.text(x_pos, s + c / 2, str(c),
-                ha="center", va="center", fontsize=6, color="#1e3a5f")
-    # total above the bar
-    if total > 0:
-        ax.text(x_pos, total + max_total * 0.015, str(total),
-                ha="center", va="bottom", fontsize=6.5, color="#111827", fontweight="bold")
+# ── Bar annotations ────────────────────────────────────────────────────────────
+for r, x_pos, jobs in zip(rows, nums, compaction_jobs):
+    if jobs > 0:
+        ax.text(
+            x_pos,
+            jobs + max_jobs * 0.015,
+            str(jobs),
+            ha="center",
+            va="bottom",
+            fontsize=6.5,
+            color="#111827",
+            fontweight="bold",
+        )
+
+    # Secondary context labels for excluded and raw background-return counts.
+    flush_imm = r["flush_imm_returns"]
+    total_bg = r["total_background_returns"]
+    if total_bg > 0:
+        ax.text(
+            x_pos,
+            max(jobs * 0.5, 0.25),
+            f"raw={total_bg}\nflush={flush_imm}",
+            ha="center",
+            va="center",
+            fontsize=5.5,
+            color="#1f2937",
+        )
 
 # ── Threshold lines ────────────────────────────────────────────────────────────
 for x, color, label in [
@@ -118,7 +137,7 @@ ax.set_xlabel("--num  (KV pairs written)", fontsize=9)
 ax.set_ylabel("compaction jobs", fontsize=9)
 ax.set_title(
     "Compaction jobs vs KV Pairs Written\n"
-    "(fillrandom, write_buffer=64K, value=1K, max_file=1M)",
+    '(event="background_compaction_return" excluding notes="flush_imm")',
     fontsize=8.5,
 )
 ax.legend(fontsize=7, loc="upper left", framealpha=0.85)

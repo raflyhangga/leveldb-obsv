@@ -4,16 +4,18 @@
 
 #include "db/version_set.h"
 
-#include <algorithm>
-#include <cstdio>
-
+#include "db/compaction_trace_writer.h"
 #include "db/filename.h"
 #include "db/log_reader.h"
 #include "db/log_writer.h"
 #include "db/memtable.h"
 #include "db/table_cache.h"
+#include <algorithm>
+#include <cstdio>
+
 #include "leveldb/env.h"
 #include "leveldb/table_builder.h"
+
 #include "table/merger.h"
 #include "table/two_level_iterator.h"
 #include "util/coding.h"
@@ -745,6 +747,10 @@ VersionSet::VersionSet(const std::string& dbname, const Options* options,
       prev_log_number_(0),
       descriptor_file_(nullptr),
       descriptor_log_(nullptr),
+      trace_writer_(options->compaction_trace_path != nullptr
+                        ? CompactionTraceWriter::Open(
+                              options->env, options->compaction_trace_path)
+                        : nullptr),
       dummy_versions_(this),
       current_(nullptr) {
   AppendVersion(new Version(this));
@@ -755,6 +761,7 @@ VersionSet::~VersionSet() {
   assert(dummy_versions_.next_ == &dummy_versions_);  // List must be empty
   delete descriptor_log_;
   delete descriptor_file_;
+  delete trace_writer_;
 }
 
 void VersionSet::AppendVersion(Version* v) {
@@ -806,10 +813,35 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
     // first call to LogAndApply (when opening the database).
     assert(descriptor_file_ == nullptr);
     new_manifest_file = DescriptorFileName(dbname_, manifest_file_number_);
+    fprintf(stderr, "[LogAndApply][tid=%llu] CREATE manifest file: %s\n",
+            (unsigned long long)CurrentOsThreadId(), new_manifest_file.c_str());
     s = env_->NewWritableFile(new_manifest_file, &descriptor_file_);
+    if (s.ok() && trace_writer_ != nullptr) {
+      CompactionTraceWriter::Row r;
+      r.trace_ts_us = env_->NowMicros();
+      r.event = "logandapply_manifest_create";
+      r.db_name = dbname_;
+      r.thread_id = CurrentOsThreadId();
+      r.file_name = new_manifest_file;
+      r.manifest_file_number = manifest_file_number_;
+      trace_writer_->Write(r);
+    }
     if (s.ok()) {
       descriptor_log_ = new log::Writer(descriptor_file_);
+      fprintf(
+          stderr, "[LogAndApply][tid=%llu] WRITE snapshot to manifest: %s\n",
+          (unsigned long long)CurrentOsThreadId(), new_manifest_file.c_str());
       s = WriteSnapshot(descriptor_log_);
+      if (s.ok() && trace_writer_ != nullptr) {
+        CompactionTraceWriter::Row r;
+        r.trace_ts_us = env_->NowMicros();
+        r.event = "logandapply_manifest_write_snapshot";
+        r.db_name = dbname_;
+        r.thread_id = CurrentOsThreadId();
+        r.file_name = new_manifest_file;
+        r.manifest_file_number = manifest_file_number_;
+        trace_writer_->Write(r);
+      }
     }
   }
 
@@ -821,9 +853,37 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
     if (s.ok()) {
       std::string record;
       edit->EncodeTo(&record);
+      fprintf(stderr,
+              "[LogAndApply][tid=%llu] WRITE record to manifest "
+              "(manifest_file_number=%llu)\n",
+              (unsigned long long)CurrentOsThreadId(),
+              (unsigned long long)manifest_file_number_);
       s = descriptor_log_->AddRecord(record);
+      if (s.ok() && trace_writer_ != nullptr) {
+        CompactionTraceWriter::Row r;
+        r.trace_ts_us = env_->NowMicros();
+        r.event = "logandapply_manifest_write_record";
+        r.db_name = dbname_;
+        r.thread_id = CurrentOsThreadId();
+        r.manifest_file_number = manifest_file_number_;
+        trace_writer_->Write(r);
+      }
       if (s.ok()) {
+        fprintf(stderr,
+                "[LogAndApply][tid=%llu] SYNC manifest "
+                "(manifest_file_number=%llu)\n",
+                (unsigned long long)CurrentOsThreadId(),
+                (unsigned long long)manifest_file_number_);
         s = descriptor_file_->Sync();
+        if (s.ok() && trace_writer_ != nullptr) {
+          CompactionTraceWriter::Row r;
+          r.trace_ts_us = env_->NowMicros();
+          r.event = "logandapply_manifest_fdatasync";
+          r.db_name = dbname_;
+          r.thread_id = CurrentOsThreadId();
+          r.manifest_file_number = manifest_file_number_;
+          trace_writer_->Write(r);
+        }
       }
       if (!s.ok()) {
         Log(options_->info_log, "MANIFEST write: %s\n", s.ToString().c_str());
@@ -833,6 +893,11 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
     // If we just created a new descriptor file, install it by writing a
     // new CURRENT file that points to it.
     if (s.ok() && !new_manifest_file.empty()) {
+      fprintf(stderr,
+              "[LogAndApply][tid=%llu] UPDATE CURRENT -> "
+              "manifest_file_number=%llu\n",
+              (unsigned long long)CurrentOsThreadId(),
+              (unsigned long long)manifest_file_number_);
       s = SetCurrentFile(env_, dbname_, manifest_file_number_);
     }
 

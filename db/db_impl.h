@@ -128,7 +128,10 @@ class DBImpl : public DB {
                         VersionEdit* edit, SequenceNumber* max_sequence)
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
-  Status WriteLevel0Table(MemTable* mem, VersionEdit* edit, Version* base)
+  Status WriteLevel0Table(MemTable* mem, VersionEdit* edit, Version* base,
+                          uint64_t* output_file_number = nullptr,
+                          uint64_t* output_file_size = nullptr,
+                          int* output_level = nullptr)
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
   Status MakeRoomForWrite(bool force /* compact even if there is room? */)
@@ -209,10 +212,6 @@ class DBImpl : public DB {
   // (Options::compaction_trace_path != nullptr).  Created at DB open time and
   // destroyed with the DB.  CompactionTraceWriter is internally thread-safe.
   CompactionTraceWriter* trace_writer_;
-
-  // Monotonically increasing compaction job ID counter.  Accessed only while
-  // mutex_ is held, so a plain uint64_t is sufficient.
-  uint64_t next_compaction_job_id_ GUARDED_BY(mutex_);
 };
 
 // Sanitize db options.  The caller should delete result.info_log if

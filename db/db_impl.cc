@@ -4,14 +4,6 @@
 
 #include "db/db_impl.h"
 
-#include <algorithm>
-#include <atomic>
-#include <cstdint>
-#include <cstdio>
-#include <set>
-#include <string>
-#include <vector>
-
 #include "db/builder.h"
 #include "db/db_iter.h"
 #include "db/dbformat.h"
@@ -22,11 +14,20 @@
 #include "db/table_cache.h"
 #include "db/version_set.h"
 #include "db/write_batch_internal.h"
+#include <algorithm>
+#include <atomic>
+#include <cstdint>
+#include <cstdio>
+#include <set>
+#include <string>
+#include <vector>
+
 #include "leveldb/db.h"
 #include "leveldb/env.h"
 #include "leveldb/status.h"
 #include "leveldb/table.h"
 #include "leveldb/table_builder.h"
+
 #include "port/port.h"
 #include "table/block.h"
 #include "table/merger.h"
@@ -38,35 +39,6 @@
 namespace leveldb {
 
 const int kNumNonTableCacheFiles = 10;
-
-// ---------------------------------------------------------------------------
-// Compaction trace helpers
-// ---------------------------------------------------------------------------
-
-// Extracts the user key bytes (raw) from an InternalKey.
-static std::string TraceUserKey(const InternalKey& ikey) {
-  Slice uk = ikey.user_key();
-  return std::string(uk.data(), uk.size());
-}
-
-// Extracts the sequence number from an InternalKey.
-// Internal key encoding: user_key + fixed64((seqno << 8) | value_type).
-static uint64_t TraceSeqno(const InternalKey& ikey) {
-  Slice enc = ikey.Encode();
-  if (enc.size() < 8) return 0;
-  return DecodeFixed64(enc.data() + enc.size() - 8) >> 8;
-}
-
-// Fills the key-range fields of a trace Row from an InternalKey pair.
-static void TraceSetKeyRange(CompactionTraceWriter::Row* row,
-                             const InternalKey& smallest,
-                             const InternalKey& largest) {
-  row->has_file_keys = true;
-  row->smallest_user_key = TraceUserKey(smallest);
-  row->largest_user_key = TraceUserKey(largest);
-  row->seqno_smallest = TraceSeqno(smallest);
-  row->seqno_largest = TraceSeqno(largest);
-}
 
 // Information kept for every waiting writer
 struct DBImpl::Writer {
@@ -95,11 +67,7 @@ struct DBImpl::CompactionState {
         smallest_snapshot(0),
         outfile(nullptr),
         builder(nullptr),
-        total_bytes(0),
-        job_id(0),
-        is_manual(false),
-        start_ts_us(0),
-        bg_thread_id(0) {}
+        total_bytes(0) {}
 
   Compaction* const compaction;
 
@@ -116,13 +84,6 @@ struct DBImpl::CompactionState {
   TableBuilder* builder;
 
   uint64_t total_bytes;
-
-  // Trace context (populated by BackgroundCompaction before DoCompactionWork).
-  uint64_t job_id;
-  bool is_manual;
-  std::string compaction_reason;
-  uint64_t start_ts_us;
-  uint64_t bg_thread_id;
 };
 
 // Fix user-supplied options to be reasonable
@@ -188,11 +149,11 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
       manual_compaction_(nullptr),
       versions_(new VersionSet(dbname_, &options_, table_cache_,
                                &internal_comparator_)),
-      trace_writer_(raw_options.compaction_trace_path != nullptr
-                        ? CompactionTraceWriter::Open(raw_options.env,
-                                                      raw_options.compaction_trace_path)
-                        : nullptr),
-      next_compaction_job_id_(1) {}
+      trace_writer_(
+          raw_options.compaction_trace_path != nullptr
+              ? CompactionTraceWriter::Open(raw_options.env,
+                                            raw_options.compaction_trace_path)
+              : nullptr) {}
 
 DBImpl::~DBImpl() {
   // Wait for background work to finish.
@@ -204,7 +165,13 @@ DBImpl::~DBImpl() {
   mutex_.Unlock();
 
   if (db_lock_ != nullptr) {
+    fprintf(stderr, "[Close][tid=%llu] Unlocking %s\n",
+            (unsigned long long)CurrentOsThreadId(),
+            LockFileName(dbname_).c_str());
     env_->UnlockFile(db_lock_);
+    fprintf(stderr, "[Close][tid=%llu] Unlocked %s\n",
+            (unsigned long long)CurrentOsThreadId(),
+            LockFileName(dbname_).c_str());
   }
 
   delete versions_;
@@ -343,7 +310,18 @@ Status DBImpl::Recover(VersionEdit* edit, bool* save_manifest) {
   // may already exist from a previous failed creation attempt.
   env_->CreateDir(dbname_);
   assert(db_lock_ == nullptr);
-  Status s = env_->LockFile(LockFileName(dbname_), &db_lock_);
+  const std::string lockname = LockFileName(dbname_);
+  fprintf(stderr, "[Recover][tid=%llu] Locking %s\n",
+          (unsigned long long)CurrentOsThreadId(), lockname.c_str());
+  Status s = env_->LockFile(lockname, &db_lock_);
+  if (s.ok()) {
+    fprintf(stderr, "[Recover][tid=%llu] Locked %s\n",
+            (unsigned long long)CurrentOsThreadId(), lockname.c_str());
+  } else {
+    fprintf(stderr, "[Recover][tid=%llu] Failed to lock %s: %s\n",
+            (unsigned long long)CurrentOsThreadId(), lockname.c_str(),
+            s.ToString().c_str());
+  }
   if (!s.ok()) {
     return s;
   }
@@ -548,8 +526,9 @@ Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log,
   return status;
 }
 
-Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
-                                Version* base) {
+Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit, Version* base,
+                                uint64_t* output_file_number,
+                                uint64_t* output_file_size, int* output_level) {
   mutex_.AssertHeld();
   const uint64_t start_micros = env_->NowMicros();
   FileMetaData meta;
@@ -562,6 +541,9 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
   Status s;
   {
     mutex_.Unlock();
+    fprintf(stderr, "[WriteLevel0Table][tid=%llu] Building table #%llu\n",
+            (unsigned long long)CurrentOsThreadId(),
+            (unsigned long long)meta.number);
     s = BuildTable(dbname_, env_, options_, table_cache_, iter, &meta);
     mutex_.Lock();
   }
@@ -584,6 +566,15 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
     edit->AddFile(level, meta.number, meta.file_size, meta.smallest,
                   meta.largest);
   }
+  if (output_file_number != nullptr) {
+    *output_file_number = meta.number;
+  }
+  if (output_file_size != nullptr) {
+    *output_file_size = meta.file_size;
+  }
+  if (output_level != nullptr) {
+    *output_level = level;
+  }
 
   CompactionStats stats;
   stats.micros = env_->NowMicros() - start_micros;
@@ -593,6 +584,8 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
 }
 
 void DBImpl::CompactMemTable() {
+  fprintf(stderr, "[CompactMemTable][tid=%llu] Starting memtable compaction\n",
+          (unsigned long long)CurrentOsThreadId());
   mutex_.AssertHeld();
   assert(imm_ != nullptr);
 
@@ -753,26 +746,50 @@ void DBImpl::BackgroundCall() {
 
 void DBImpl::BackgroundCompaction() {
   mutex_.AssertHeld();
+  const uint64_t tid = CurrentOsThreadId();
+  if (trace_writer_ != nullptr) {
+    CompactionTraceWriter::Row r;
+    r.trace_ts_us = env_->NowMicros();
+    r.event = "background_compaction_start";
+    r.db_name = dbname_;
+    r.thread_id = tid;
+    trace_writer_->Write(r);
+  }
+  fprintf(stderr,
+          "[BackgroundCompaction][tid=%llu] Starting background compaction\n",
+          (unsigned long long)tid);
 
+  // Flush imm_ first: unblocks stalled writers faster than a full compaction
+  // would.
   if (imm_ != nullptr) {
+    if (trace_writer_ != nullptr) {
+      CompactionTraceWriter::Row r;
+      r.trace_ts_us = env_->NowMicros();
+      r.event = "background_compaction_flush_imm";
+      r.db_name = dbname_;
+      r.thread_id = tid;
+      trace_writer_->Write(r);
+    }
     CompactMemTable();
+    fprintf(stderr,
+            "[BackgroundCompaction][tid=%llu] Finished memtable compaction, "
+            "requeued..\n",
+            (unsigned long long)tid);
+    if (trace_writer_ != nullptr) {
+      CompactionTraceWriter::Row r;
+      r.trace_ts_us = env_->NowMicros();
+      r.event = "background_compaction_return";
+      r.db_name = dbname_;
+      r.thread_id = tid;
+      r.notes = "flush_imm";
+      trace_writer_->Write(r);
+    }
     return;
   }
 
   Compaction* c;
   bool is_manual = (manual_compaction_ != nullptr);
   InternalKey manual_end;
-
-  // Derive compaction reason before calling PickCompaction so that we can
-  // inspect version state while mutex_ is still held.
-  const char* compaction_reason = "manual";
-  if (!is_manual) {
-    if (versions_->current()->compaction_score() >= 1) {
-      compaction_reason = "size";
-    } else {
-      compaction_reason = "seek";
-    }
-  }
 
   if (is_manual) {
     ManualCompaction* m = manual_compaction_;
@@ -794,49 +811,10 @@ void DBImpl::BackgroundCompaction() {
   if (c == nullptr) {
     // Nothing to do
   } else if (!is_manual && c->IsTrivialMove()) {
-    // Move file to next level
+    // No key-range overlap with level+1 files: just repoint the file metadata,
+    // zero merge I/O. DoCompactionWork() is bypassed entirely.
     assert(c->num_input_files(0) == 1);
     FileMetaData* f = c->input(0, 0);
-
-    // --- Trivial-move oracle path ---
-    uint64_t trivial_job_id = 0;
-    uint64_t trivial_start_ts = 0;
-    uint64_t trivial_tid = 0;
-    if (trace_writer_ != nullptr) {
-      trivial_job_id = next_compaction_job_id_++;
-      trivial_start_ts = env_->NowMicros();
-      trivial_tid = CurrentOsThreadId();
-
-      // job_start
-      CompactionTraceWriter::Row r;
-      r.trace_ts_us = trivial_start_ts;
-      r.job_id = trivial_job_id;
-      r.event_type = "job_start";
-      r.db_name = dbname_;
-      r.is_manual = 0;
-      r.is_trivial_move = 1;
-      r.compaction_reason = compaction_reason;
-      r.source_level = c->level();
-      r.target_level = c->level() + 1;
-      r.bg_thread_id = trivial_tid;
-      TraceSetKeyRange(&r, f->smallest, f->largest);
-      trace_writer_->Write(r);
-
-      // job_input (the single file being moved)
-      r = CompactionTraceWriter::Row();
-      r.trace_ts_us = env_->NowMicros();
-      r.job_id = trivial_job_id;
-      r.event_type = "job_input";
-      r.db_name = dbname_;
-      r.source_level = c->level();
-      r.target_level = c->level() + 1;
-      r.bg_thread_id = trivial_tid;
-      r.file_number = f->number;
-      r.file_size = f->file_size;
-      TraceSetKeyRange(&r, f->smallest, f->largest);
-      trace_writer_->Write(r);
-    }
-    // --------------------------------
 
     c->edit()->RemoveFile(c->level(), f->number);
     c->edit()->AddFile(c->level() + 1, f->number, f->file_size, f->smallest,
@@ -850,64 +828,8 @@ void DBImpl::BackgroundCompaction() {
         static_cast<unsigned long long>(f->number), c->level() + 1,
         static_cast<unsigned long long>(f->file_size),
         status.ToString().c_str(), versions_->LevelSummary(&tmp));
-
-    // --- Trivial-move oracle path (post-install) ---
-    if (trace_writer_ != nullptr) {
-      // job_install
-      CompactionTraceWriter::Row r;
-      r.trace_ts_us = env_->NowMicros();
-      r.job_id = trivial_job_id;
-      r.event_type = "job_install";
-      r.db_name = dbname_;
-      r.source_level = c->level();
-      r.target_level = c->level() + 1;
-      r.bg_thread_id = trivial_tid;
-      r.status = status.ok() ? "ok" : status.ToString();
-      trace_writer_->Write(r);
-
-      if (status.ok()) {
-        // job_input_delete (logical obsolescence of the moved file)
-        r = CompactionTraceWriter::Row();
-        r.trace_ts_us = env_->NowMicros();
-        r.job_id = trivial_job_id;
-        r.event_type = "job_input_delete";
-        r.db_name = dbname_;
-        r.source_level = c->level();
-        r.bg_thread_id = trivial_tid;
-        r.file_number = f->number;
-        r.file_size = f->file_size;
-        TraceSetKeyRange(&r, f->smallest, f->largest);
-        r.notes = "logical install-time obsolescence";
-        trace_writer_->Write(r);
-      }
-
-      // job_end
-      r = CompactionTraceWriter::Row();
-      r.trace_ts_us = env_->NowMicros();
-      r.job_id = trivial_job_id;
-      r.event_type = "job_end";
-      r.db_name = dbname_;
-      r.source_level = c->level();
-      r.target_level = c->level() + 1;
-      r.bg_thread_id = trivial_tid;
-      r.status = status.ok() ? "ok" : status.ToString();
-      r.bytes_read_logical = f->file_size;
-      r.bytes_written_logical = 0;  // no bytes written for trivial move
-      r.input_count = 1;
-      r.output_count = 0;
-      trace_writer_->Write(r);
-    }
-    // -----------------------------------------------
   } else {
     CompactionState* compact = new CompactionState(c);
-
-    // Populate trace context before entering DoCompactionWork.
-    if (trace_writer_ != nullptr) {
-      compact->job_id = next_compaction_job_id_++;
-      compact->is_manual = is_manual;
-      compact->compaction_reason = compaction_reason;
-      compact->bg_thread_id = CurrentOsThreadId();
-    }
 
     status = DoCompactionWork(compact);
     if (!status.ok()) {
@@ -940,6 +862,21 @@ void DBImpl::BackgroundCompaction() {
     }
     manual_compaction_ = nullptr;
   }
+
+  fprintf(stderr,
+          "[BackgroundCompaction][tid=%llu] Completed background compaction\n",
+          (unsigned long long)tid);
+  if (trace_writer_ != nullptr) {
+    CompactionTraceWriter::Row r;
+    r.trace_ts_us = env_->NowMicros();
+    r.event = "background_compaction_return";
+    r.db_name = dbname_;
+    r.thread_id = tid;
+    if (!status.ok()) {
+      r.status = status.ToString();
+    }
+    trace_writer_->Write(r);
+  }
 }
 
 void DBImpl::CleanupCompaction(CompactionState* compact) {
@@ -964,6 +901,8 @@ Status DBImpl::OpenCompactionOutputFile(CompactionState* compact) {
   assert(compact->builder == nullptr);
   uint64_t file_number;
   {
+    // Re-acquire mutex only for the file-number allocation; release immediately
+    // so the actual file creation below does not hold the lock.
     mutex_.Lock();
     file_number = versions_->NewFileNumber();
     pending_outputs_.insert(file_number);
@@ -977,25 +916,25 @@ Status DBImpl::OpenCompactionOutputFile(CompactionState* compact) {
 
   // Make the output file
   std::string fname = TableFileName(dbname_, file_number);
+  fprintf(stderr,
+          "[OpenCompactionOutputFile][tid=%llu] Creating output file %s\n",
+          (unsigned long long)CurrentOsThreadId(), fname.c_str());
   Status s = env_->NewWritableFile(fname, &compact->outfile);
   if (s.ok()) {
     compact->builder = new TableBuilder(options_, compact->outfile);
   }
 
-  // job_output_create
+  // Simplified trace event: output file creation.
   if (s.ok() && trace_writer_ != nullptr) {
     CompactionTraceWriter::Row r;
     r.trace_ts_us = env_->NowMicros();
-    r.job_id = compact->job_id;
-    r.event_type = "job_output_create";
+    r.event = "open_compaction_output_file_create";
     r.db_name = dbname_;
-    r.bg_thread_id = compact->bg_thread_id;
+    r.thread_id = CurrentOsThreadId();
     r.file_number = file_number;
     // Emit the base filename only (not the full absolute path).
-    r.file_name = fname.substr(fname.rfind('/') == std::string::npos
-                                    ? 0
-                                    : fname.rfind('/') + 1);
-    r.output_level = compact->compaction->level() + 1;
+    r.file_name = fname.substr(
+        fname.rfind('/') == std::string::npos ? 0 : fname.rfind('/') + 1);
     trace_writer_->Write(r);
   }
 
@@ -1049,35 +988,22 @@ Status DBImpl::FinishCompactionOutputFile(CompactionState* compact,
     }
   }
 
-  // job_output_finish — emit only for successfully finished outputs.
-  if (s.ok() && trace_writer_ != nullptr && current_entries > 0) {
-    const CompactionState::Output& out = *compact->current_output();
-    CompactionTraceWriter::Row r;
-    r.trace_ts_us = env_->NowMicros();
-    r.job_id = compact->job_id;
-    r.event_type = "job_output_finish";
-    r.db_name = dbname_;
-    r.bg_thread_id = compact->bg_thread_id;
-    r.file_number = out.number;
-    r.file_size = out.file_size;
-    r.output_level = compact->compaction->level() + 1;
-    if (!out.smallest.Encode().empty() && !out.largest.Encode().empty()) {
-      TraceSetKeyRange(&r, out.smallest, out.largest);
-    }
-    trace_writer_->Write(r);
-  }
-
   return s;
 }
 
 Status DBImpl::InstallCompactionResults(CompactionState* compact) {
   mutex_.AssertHeld();
+  fprintf(
+      stderr,
+      "[InstallCompactionResults][tid=%llu] Installing compaction results\n",
+      (unsigned long long)CurrentOsThreadId());
   Log(options_.info_log, "Compacted %d@%d + %d@%d files => %lld bytes",
       compact->compaction->num_input_files(0), compact->compaction->level(),
       compact->compaction->num_input_files(1), compact->compaction->level() + 1,
       static_cast<long long>(compact->total_bytes));
 
-  // Add compaction outputs
+  // Record all input files as deleted in the version edit so LogAndApply
+  // atomically removes them and adds the output files in one MANIFEST write.
   compact->compaction->AddInputDeletions(compact->compaction->edit());
   const int level = compact->compaction->level();
   for (size_t i = 0; i < compact->outputs.size(); i++) {
@@ -1086,46 +1012,6 @@ Status DBImpl::InstallCompactionResults(CompactionState* compact) {
                                          out.smallest, out.largest);
   }
   Status s = versions_->LogAndApply(compact->compaction->edit(), &mutex_);
-
-  if (trace_writer_ != nullptr) {
-    // job_install — emitted regardless of success/failure.
-    {
-      CompactionTraceWriter::Row r;
-      r.trace_ts_us = env_->NowMicros();
-      r.job_id = compact->job_id;
-      r.event_type = "job_install";
-      r.db_name = dbname_;
-      r.source_level = compact->compaction->level();
-      r.target_level = compact->compaction->level() + 1;
-      r.bg_thread_id = compact->bg_thread_id;
-      r.status = s.ok() ? "ok" : s.ToString();
-      trace_writer_->Write(r);
-    }
-
-    // job_input_delete — emitted only on successful install.
-    // Represents logical install-time obsolescence; physical unlink timing
-    // is deferred to RemoveObsoleteFiles().
-    if (s.ok()) {
-      for (int which = 0; which < 2; which++) {
-        int src_level = compact->compaction->level() + which;
-        for (int i = 0; i < compact->compaction->num_input_files(which); i++) {
-          const FileMetaData* f = compact->compaction->input(which, i);
-          CompactionTraceWriter::Row r;
-          r.trace_ts_us = env_->NowMicros();
-          r.job_id = compact->job_id;
-          r.event_type = "job_input_delete";
-          r.db_name = dbname_;
-          r.source_level = src_level;
-          r.bg_thread_id = compact->bg_thread_id;
-          r.file_number = f->number;
-          r.file_size = f->file_size;
-          TraceSetKeyRange(&r, f->smallest, f->largest);
-          r.notes = "logical install-time obsolescence";
-          trace_writer_->Write(r);
-        }
-      }
-    }
-  }
 
   return s;
 }
@@ -1142,78 +1028,21 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   assert(versions_->NumLevelFiles(compact->compaction->level()) > 0);
   assert(compact->builder == nullptr);
   assert(compact->outfile == nullptr);
+  // Any seqno strictly below smallest_snapshot is invisible to all live
+  // readers; older versions of the same key below this threshold can be safely
+  // dropped.
   if (snapshots_.empty()) {
     compact->smallest_snapshot = versions_->LastSequence();
   } else {
     compact->smallest_snapshot = snapshots_.oldest()->sequence_number();
   }
 
-  // Emit job_start and job_input rows while mutex_ is still held so that
-  // the complete selected input set is recorded before any output activity.
-  if (trace_writer_ != nullptr) {
-    compact->start_ts_us = start_micros;
-
-    // Compute the compaction-wide key range from the union of all inputs.
-    const InternalKey* job_smallest = nullptr;
-    const InternalKey* job_largest = nullptr;
-    const InternalKeyComparator& icmp = internal_comparator_;
-    for (int which = 0; which < 2; which++) {
-      for (int i = 0; i < compact->compaction->num_input_files(which); i++) {
-        const FileMetaData* f = compact->compaction->input(which, i);
-        if (job_smallest == nullptr ||
-            icmp.Compare(f->smallest, *job_smallest) < 0) {
-          job_smallest = &f->smallest;
-        }
-        if (job_largest == nullptr ||
-            icmp.Compare(f->largest, *job_largest) > 0) {
-          job_largest = &f->largest;
-        }
-      }
-    }
-
-    // job_start
-    {
-      CompactionTraceWriter::Row r;
-      r.trace_ts_us = start_micros;
-      r.job_id = compact->job_id;
-      r.event_type = "job_start";
-      r.db_name = dbname_;
-      r.is_manual = compact->is_manual ? 1 : 0;
-      r.is_trivial_move = 0;
-      r.compaction_reason = compact->compaction_reason;
-      r.source_level = compact->compaction->level();
-      r.target_level = compact->compaction->level() + 1;
-      r.bg_thread_id = compact->bg_thread_id;
-      if (job_smallest != nullptr && job_largest != nullptr) {
-        TraceSetKeyRange(&r, *job_smallest, *job_largest);
-      }
-      trace_writer_->Write(r);
-    }
-
-    // job_input — one row per selected input file.
-    for (int which = 0; which < 2; which++) {
-      int src_level = compact->compaction->level() + which;
-      for (int i = 0; i < compact->compaction->num_input_files(which); i++) {
-        const FileMetaData* f = compact->compaction->input(which, i);
-        CompactionTraceWriter::Row r;
-        r.trace_ts_us = env_->NowMicros();
-        r.job_id = compact->job_id;
-        r.event_type = "job_input";
-        r.db_name = dbname_;
-        r.source_level = src_level;
-        r.target_level = compact->compaction->level() + 1;
-        r.bg_thread_id = compact->bg_thread_id;
-        r.file_number = f->number;
-        r.file_size = f->file_size;
-        TraceSetKeyRange(&r, f->smallest, f->largest);
-        trace_writer_->Write(r);
-      }
-    }
-  }
-
+  // MakeInputIterator merges all input files across both levels into one sorted
+  // stream.
   Iterator* input = versions_->MakeInputIterator(compact->compaction);
 
-  // Release mutex while we're actually doing the compaction work
+  // Compaction I/O is the bottleneck; holding mutex_ here would block all
+  // writers.
   mutex_.Unlock();
 
   input->SeekToFirst();
@@ -1223,7 +1052,8 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   bool has_current_user_key = false;
   SequenceNumber last_sequence_for_key = kMaxSequenceNumber;
   while (input->Valid() && !shutting_down_.load(std::memory_order_acquire)) {
-    // Prioritize immutable compaction work
+    // Imm flush unblocks stalled writers; pause this job to let it complete
+    // first.
     if (has_imm_.load(std::memory_order_relaxed)) {
       const uint64_t imm_start = env_->NowMicros();
       mutex_.Lock();
@@ -1237,6 +1067,9 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
     }
 
     Slice key = input->key();
+    // Seal the current output early to limit overlap with grandparent-level
+    // files, bounding the cost of the *next* compaction that touches this
+    // output.
     if (compact->compaction->ShouldStopBefore(key) &&
         compact->builder != nullptr) {
       status = FinishCompactionOutputFile(compact, input);
@@ -1263,18 +1096,17 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
       }
 
       if (last_sequence_for_key <= compact->smallest_snapshot) {
-        // Hidden by an newer entry for same user key
+        // A newer version of this key was already emitted above it in the
+        // merged stream; this older copy is invisible to all snapshots.
         drop = true;  // (A)
       } else if (ikey.type == kTypeDeletion &&
                  ikey.sequence <= compact->smallest_snapshot &&
                  compact->compaction->IsBaseLevelForKey(ikey.user_key)) {
-        // For this user key:
-        // (1) there is no data in higher levels
-        // (2) data in lower levels will have larger sequence numbers
-        // (3) data in layers that are being compacted here and have
-        //     smaller sequence numbers will be dropped in the next
-        //     few iterations of this loop (by rule (A) above).
-        // Therefore this deletion marker is obsolete and can be dropped.
+        // Tombstone can be dropped only when three conditions hold
+        // simultaneously: no live data for this key exists at deeper levels
+        // (IsBaseLevelForKey), the tombstone is below the snapshot horizon, and
+        // older versions at this level will be dropped by rule (A) in
+        // subsequent iterations.
         drop = true;
       }
 
@@ -1351,28 +1183,6 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   }
   VersionSet::LevelSummaryStorage tmp;
   Log(options_.info_log, "compacted to: %s", versions_->LevelSummary(&tmp));
-
-  // job_end
-  if (trace_writer_ != nullptr) {
-    int total_inputs = 0;
-    for (int which = 0; which < 2; which++) {
-      total_inputs += compact->compaction->num_input_files(which);
-    }
-    CompactionTraceWriter::Row r;
-    r.trace_ts_us = env_->NowMicros();
-    r.job_id = compact->job_id;
-    r.event_type = "job_end";
-    r.db_name = dbname_;
-    r.source_level = compact->compaction->level();
-    r.target_level = compact->compaction->level() + 1;
-    r.bg_thread_id = compact->bg_thread_id;
-    r.status = status.ok() ? "ok" : status.ToString();
-    r.bytes_read_logical = static_cast<uint64_t>(stats.bytes_read);
-    r.bytes_written_logical = static_cast<uint64_t>(stats.bytes_written);
-    r.input_count = total_inputs;
-    r.output_count = static_cast<int>(compact->outputs.size());
-    trace_writer_->Write(r);
-  }
 
   return status;
 }
@@ -1823,7 +1633,8 @@ DB::~DB() = default;
 
 Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr) {
   *dbptr = nullptr;
-
+  fprintf(stderr, "[Open][tid=%llu] Opening database %s\n",
+          (unsigned long long)CurrentOsThreadId(), dbname.c_str());
   DBImpl* impl = new DBImpl(options, dbname);
   impl->mutex_.Lock();
   VersionEdit edit;
@@ -1848,6 +1659,9 @@ Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr) {
   if (s.ok() && save_manifest) {
     edit.SetPrevLogNumber(0);  // No older logs needed after recovery.
     edit.SetLogNumber(impl->logfile_number_);
+    fprintf(stderr, "[Open][tid=%llu] Saving manifest with log number: %llu\n",
+            (unsigned long long)CurrentOsThreadId(),
+            (unsigned long long)impl->logfile_number_);
     s = impl->versions_->LogAndApply(&edit, &impl->mutex_);
   }
   if (s.ok()) {
@@ -1877,7 +1691,17 @@ Status DestroyDB(const std::string& dbname, const Options& options) {
 
   FileLock* lock;
   const std::string lockname = LockFileName(dbname);
+  fprintf(stderr, "[DestroyDB][tid=%llu] Locking %s\n",
+          (unsigned long long)CurrentOsThreadId(), lockname.c_str());
   result = env->LockFile(lockname, &lock);
+  if (result.ok()) {
+    fprintf(stderr, "[DestroyDB][tid=%llu] Locked %s\n",
+            (unsigned long long)CurrentOsThreadId(), lockname.c_str());
+  } else {
+    fprintf(stderr, "[DestroyDB][tid=%llu] Failed to lock %s: %s\n",
+            (unsigned long long)CurrentOsThreadId(), lockname.c_str(),
+            result.ToString().c_str());
+  }
   if (result.ok()) {
     uint64_t number;
     FileType type;
@@ -1890,7 +1714,11 @@ Status DestroyDB(const std::string& dbname, const Options& options) {
         }
       }
     }
+    fprintf(stderr, "[DestroyDB][tid=%llu] Unlocking %s\n",
+            (unsigned long long)CurrentOsThreadId(), lockname.c_str());
     env->UnlockFile(lock);  // Ignore error since state is already gone
+    fprintf(stderr, "[DestroyDB][tid=%llu] Unlocked %s\n",
+            (unsigned long long)CurrentOsThreadId(), lockname.c_str());
     env->RemoveFile(lockname);
     env->RemoveDir(dbname);  // Ignore error in case dir contains other files
   }

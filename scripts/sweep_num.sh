@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# sweep_num.sh — vary --num across the compaction threshold and record job counts
+# sweep_num.sh — vary --num across the compaction threshold and record compaction job counts
 #
 # Usage:  ./scripts/sweep_num.sh [output_dir]
 # Output: one CSV file per run in output_dir, plus a summary TSV at output_dir/summary.tsv
@@ -20,7 +20,7 @@ SUMMARY="$OUT_DIR/summary.tsv"
 # Workload-A territory (expect 0 compactions)
 A_NUMS=(100 200)
 # Workload-B territory (find the threshold)
-B_NUMS=(450 500)
+B_NUMS=(450 500 600 700 800 900)
 # Workload-C territory (expect many compactions)
 C_NUMS=(1000 1500 2000 10000 50000)
 
@@ -30,7 +30,7 @@ mkdir -p "$OUT_DIR" "$DB_BASE"
 rm -f "$SUMMARY"
 
 # Header
-printf "num\tjob_starts\tjob_completions\ttrivial_moves\tnormal_jobs\n" >> "$SUMMARY"
+printf "num\tcompaction_jobs\tflush_imm_returns\ttotal_background_returns\n" >> "$SUMMARY"
 
 echo "=== num sweep: write_buffer_size=65536 value_size=1024 fillrandom ==="
 echo ""
@@ -56,20 +56,46 @@ for num in "${ALL_NUMS[@]}"; do
 
     if [[ ! -f "$trace" ]]; then
         echo "num=$num  [no trace file — 0 compactions]"
-        printf "%d\t0\t0\t0\t0\n" "$num" >> "$SUMMARY"
+        printf "%d\t0\t0\t0\n" "$num" >> "$SUMMARY"
         continue
     fi
 
-    # Count initiated jobs (job_start) and completed jobs (job_end status="ok")
-    job_starts=$(awk -F',' 'NR>1 && $4=="job_start"' "$trace" | wc -l)
-    job_completions=$(awk -F',' 'NR>1 && $4=="job_end" && $21=="\"ok\""' "$trace" | wc -l)
-    trivial=$(awk -F',' 'NR>1 && $4=="job_end" && $21=="\"ok\"" && $8=="1"' "$trace" | wc -l)
-    normal=$(( job_completions - trivial ))
+    # New trace CSV columns:
+    # trace_ts_us,event_index,event,db_name,thread_id,file_number,file_name,manifest_file_number,status,notes
+    # Count compaction jobs as background_compaction_return where:
+    #   - notes != "flush_imm"
+    #   - status does not start with "IO error"
+    counts=$(awk -F',' '
+        NR > 1 {
+            event = $3
+            status = $9
+            notes = $10
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", event)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", status)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", notes)
+            gsub(/^"|"$/, "", status)
+            gsub(/^"|"$/, "", notes)
+            if (event == "background_compaction_return") {
+                total++
+                if (notes == "flush_imm") {
+                    flush_imm++
+                } else if (status ~ /^IO error/) {
+                    io_error++
+                } else {
+                    jobs++
+                }
+            }
+        }
+        END {
+            printf "%d %d %d\n", jobs + 0, flush_imm + 0, total + 0
+        }
+    ' "$trace")
+    read -r compaction_jobs flush_imm_returns total_background_returns <<< "$counts"
 
-    printf "num=%-5d  job_starts=%-3d  job_completions=%-3d  (trivial=%-2d  normal=%-2d)\n" \
-        "$num" "$job_starts" "$job_completions" "$trivial" "$normal"
+    printf "num=%-5d  compaction_jobs=%-3d  (flush_imm_returns=%-2d  total_background_returns=%-3d)\n" \
+        "$num" "$compaction_jobs" "$flush_imm_returns" "$total_background_returns"
 
-    printf "%d\t%d\t%d\t%d\t%d\n" "$num" "$job_starts" "$job_completions" "$trivial" "$normal" >> "$SUMMARY"
+    printf "%d\t%d\t%d\t%d\n" "$num" "$compaction_jobs" "$flush_imm_returns" "$total_background_returns" >> "$SUMMARY"
 done
 
 echo ""

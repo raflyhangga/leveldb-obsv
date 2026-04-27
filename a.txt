@@ -1,0 +1,119 @@
+LevelDB:    version 1.23
+Date:       Wed Apr 22 23:13:52 2026
+CPU:        32 * Intel(R) Xeon(R) CPU E5-2630 v3 @ 2.40GHz
+CPUCache:   20480 KB
+[Open][tid=1169877] Opening database /tmp/ldb-b
+[Recover][tid=1169877] Locking /tmp/ldb-b/LOCK
+[Recover][tid=1169877] Locked /tmp/ldb-b/LOCK
+[Open][tid=1169877] Saving manifest with log number: 3
+[LogAndApply][tid=1169877] CREATE manifest file: /tmp/ldb-b/MANIFEST-000002
+[LogAndApply][tid=1169877] WRITE snapshot to manifest: /tmp/ldb-b/MANIFEST-000002
+[LogAndApply][tid=1169877] WRITE record to manifest (manifest_file_number=2)
+[LogAndApply][tid=1169877] SYNC manifest (manifest_file_number=2)
+[LogAndApply][tid=1169877] UPDATE CURRENT -> manifest_file_number=2
+[Close][tid=1169877] Unlocking /tmp/ldb-b/LOCK
+[Close][tid=1169877] Unlocked /tmp/ldb-b/LOCK
+[DestroyDB][tid=1169877] Locking /tmp/ldb-b/LOCK
+[DestroyDB][tid=1169877] Locked /tmp/ldb-b/LOCK
+[DestroyDB][tid=1169877] Unlocking /tmp/ldb-b/LOCK
+[DestroyDB][tid=1169877] Unlocked /tmp/ldb-b/LOCK
+[Open][tid=1169877] Opening database /tmp/ldb-b
+[Recover][tid=1169877] Locking /tmp/ldb-b/LOCK
+[Recover][tid=1169877] Locked /tmp/ldb-b/LOCK
+[Open][tid=1169877] Saving manifest with log number: 3
+[LogAndApply][tid=1169877] CREATE manifest file: /tmp/ldb-b/MANIFEST-000002
+[LogAndApply][tid=1169877] WRITE snapshot to manifest: /tmp/ldb-b/MANIFEST-000002
+[LogAndApply][tid=1169877] WRITE record to manifest (manifest_file_number=2)
+[LogAndApply][tid=1169877] SYNC manifest (manifest_file_number=2)
+[LogAndApply][tid=1169877] UPDATE CURRENT -> manifest_file_number=2
+[BackgroundCompaction][tid=1169879] Starting background compaction
+[CompactMemTable][tid=1169879] Starting memtable compaction
+[WriteLevel0Table][tid=1169879] Building table #5
+[BuildTable][tid=1169879] Creating output file /tmp/ldb-b/000005.ldb
+... finished 100 ops                              
+[LogAndApply][tid=1169879] WRITE record to manifest (manifest_file_number=2)
+[LogAndApply][tid=1169879] SYNC manifest (manifest_file_number=2)
+[BackgroundCompaction][tid=1169879] Finished memtable compaction, requeued..
+[BackgroundCompaction][tid=1169879] Starting background compaction
+[CompactMemTable][tid=1169879] Starting memtable compaction
+[WriteLevel0Table][tid=1169879] Building table #7
+[BuildTable][tid=1169879] Creating output file /tmp/ldb-b/000007.ldb
+[LogAndApply][tid=1169879] WRITE record to manifest (manifest_file_number=2)
+[LogAndApply][tid=1169879] SYNC manifest (manifest_file_number=2)
+[BackgroundCompaction][tid=1169879] Finished memtable compaction, requeued..
+[BackgroundCompaction][tid=1169879] Starting background compaction
+[CompactMemTable][tid=1169879] Starting memtable compaction
+[WriteLevel0Table][tid=1169879] Building table #9
+[BuildTable][tid=1169879] Creating output file /tmp/ldb-b/000009.ldb
+... finished 200 ops                              
+[LogAndApply][tid=1169879] WRITE record to manifest (manifest_file_number=2)
+[LogAndApply][tid=1169879] SYNC manifest (manifest_file_number=2)
+[BackgroundCompaction][tid=1169879] Finished memtable compaction, requeued..
+[BackgroundCompaction][tid=1169879] Starting background compaction
+[CompactMemTable][tid=1169879] Starting memtable compaction
+[WriteLevel0Table][tid=1169879] Building table #11
+[BuildTable][tid=1169879] Creating output file /tmp/ldb-b/000011.ldb
+... finished 300 ops                              
+[LogAndApply][tid=1169879] WRITE record to manifest (manifest_file_number=2)
+[LogAndApply][tid=1169879] SYNC manifest (manifest_file_number=2)
+[BackgroundCompaction][tid=1169879] Finished memtable compaction, requeued..
+[BackgroundCompaction][tid=1169879] Starting background compaction
+[CompactMemTable][tid=1169879] Starting memtable compaction
+[WriteLevel0Table][tid=1169879] Building table #13
+[BuildTable][tid=1169879] Creating output file /tmp/ldb-b/000013.ldb
+[LogAndApply][tid=1169879] WRITE record to manifest (manifest_file_number=2)
+[LogAndApply][tid=1169879] SYNC manifest (manifest_file_number=2)
+[BackgroundCompaction][tid=1169879] Finished memtable compaction, requeued..
+[BackgroundCompaction][tid=1169879] Starting background compaction
+[CompactMemTable][tid=1169879] Starting memtable compaction
+[WriteLevel0Table][tid=1169879] Building table #15
+[BuildTable][tid=1169879] Creating output file /tmp/ldb-b/000015.ldb
+... finished 400 ops                              
+[LogAndApply][tid=1169879] WRITE record to manifest (manifest_file_number=2)
+[LogAndApply][tid=1169879] SYNC manifest (manifest_file_number=2)
+[BackgroundCompaction][tid=1169879] Finished memtable compaction, requeued..
+[BackgroundCompaction][tid=1169879] Starting background compaction
+[OpenCompactionOutputFile][tid=1169879] Creating output file /tmp/ldb-b/000017.ldb
+[CompactMemTable][tid=1169879] Starting memtable compaction
+[WriteLevel0Table][tid=1169879] Building table #18
+[BuildTable][tid=1169879] Creating output file /tmp/ldb-b/000018.ldb
+Keys:       16 bytes each
+Values:     1024 bytes each (512 bytes after compression)
+Entries:    450
+RawSize:    0.4 MB (estimated)
+FileSize:   0.2 MB (estimated)
+WARNING: Optimization is disabled: benchmarks unnecessarily slow
+WARNING: Assertions are enabled; benchmarks unnecessarily slow
+WARNING: Snappy compression is not enabled
+------------------------------------------------
+fillrandom   :     547.569 micros/op;    1.8 MB/s
+[LogAndApply][tid=1169879] WRITE record to manifest (manifest_file_number=2)
+[LogAndApply][tid=1169879] SYNC manifest (manifest_file_number=2)
+[CompactMemTable][tid=1169879] Starting memtable compaction
+[WriteLevel0Table][tid=1169879] Building table #20
+[BuildTable][tid=1169879] Creating output file /tmp/ldb-b/000020.ldb
+[LogAndApply][tid=1169879] WRITE record to manifest (manifest_file_number=2)
+[LogAndApply][tid=1169879] SYNC manifest (manifest_file_number=2)
+[InstallCompactionResults][tid=1169879] Installing compaction results
+[LogAndApply][tid=1169879] WRITE record to manifest (manifest_file_number=2)
+[LogAndApply][tid=1169879] SYNC manifest (manifest_file_number=2)
+[BackgroundCompaction][tid=1169879] Completed background compaction
+[BackgroundCompaction][tid=1169879] Starting background compaction
+[OpenCompactionOutputFile][tid=1169879] Creating output file /tmp/ldb-b/000021.ldb
+[InstallCompactionResults][tid=1169879] Installing compaction results
+[LogAndApply][tid=1169879] WRITE record to manifest (manifest_file_number=2)
+[LogAndApply][tid=1169879] SYNC manifest (manifest_file_number=2)
+[BackgroundCompaction][tid=1169879] Completed background compaction
+[BackgroundCompaction][tid=1169879] Starting background compaction
+[BackgroundCompaction][tid=1169879] Completed background compaction
+[BackgroundCompaction][tid=1169879] Starting background compaction
+[OpenCompactionOutputFile][tid=1169879] Creating output file /tmp/ldb-b/000022.ldb
+[InstallCompactionResults][tid=1169879] Installing compaction results
+[LogAndApply][tid=1169879] WRITE record to manifest (manifest_file_number=2)
+[LogAndApply][tid=1169879] SYNC manifest (manifest_file_number=2)
+[BackgroundCompaction][tid=1169879] Completed background compaction
+[BackgroundCompaction][tid=1169879] Starting background compaction
+[BackgroundCompaction][tid=1169879] Completed background compaction
+compact      :  222141.000 micros/op;
+[Close][tid=1169877] Unlocking /tmp/ldb-b/LOCK
+[Close][tid=1169877] Unlocked /tmp/ldb-b/LOCK

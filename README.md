@@ -159,9 +159,9 @@ Expected: trace file created with header only — no compaction events.
 ```bash
 rm -rf /tmp/ldb-b
 ./build/db_bench \
-  --db=/tmp/ldb-b --benchmarks=fillrandom,compact \
+  --db=/tmp/ldb-b --benchmarks=fillrandom \
   --threads=1 --compression=0 \
-  --num=450 --value_size=1024 \
+  --num=800 --value_size=1024 \
   --write_buffer_size=65536 --max_file_size=1048576 \
   --compaction_trace_path=/tmp/trace-b.csv
 ```
